@@ -9,10 +9,23 @@ use axum::{
 use clap::Parser;
 use futures::TryStreamExt;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::time::Instant;
 use tower_http::trace::TraceLayer;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
+
+const RATE_LIMIT_RPM: usize = 3; // requests per minute per model
+
+const RATE_LIMITED_MODELS: &[&str] = &[
+    "anthropic/claude-opus-4.5",
+    "anthropic/claude-sonnet-4.5",
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview"
+];
+
 
 /// OpenRouter Header Proxy - Injects attribution headers for OpenRouter API requests
 #[derive(Parser, Debug)]
@@ -49,6 +62,8 @@ struct AppState {
     upstream_base: String,
     http_referer: String,
     x_title: String,
+    // Maps model name -> list of request timestamps (for rate limiting)
+    rate_limits: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
 /// Hop-by-hop headers that must NOT be forwarded by proxies
@@ -138,6 +153,53 @@ async fn proxy_handler(
         })?;
 
     tracing::debug!("Request body size: {} bytes", body_bytes.len());
+
+    // Extract model from request body and check rate limit
+    if !body_bytes.is_empty() {
+        if let Ok(body_str) = std::str::from_utf8(&body_bytes) {
+            // Parse JSON to extract model field
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                if let Some(model) = json.get("model").and_then(|m| m.as_str()) {
+                    info!("Request for model: {}", model);
+
+                    // Only rate limit if model is in the list
+                    if !RATE_LIMITED_MODELS.is_empty() && RATE_LIMITED_MODELS.contains(&model) {
+                        // Check rate limit and wait if needed
+                        loop {
+                        let wait_time = {
+                            let now = Instant::now();
+                            let mut limits = state.rate_limits.lock().await;
+                            let timestamps = limits.entry(model.to_string()).or_insert_with(Vec::new);
+
+                            // Remove timestamps older than 1 minute
+                            timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
+
+                            if timestamps.len() < RATE_LIMIT_RPM {
+                                // Record this request and proceed
+                                timestamps.push(now);
+                                info!("Rate limit: {}/{} for model {}", timestamps.len(), RATE_LIMIT_RPM, model);
+                                None
+                            } else {
+                                // Find oldest timestamp and calculate wait time
+                                let oldest = timestamps.iter().min().unwrap();
+                                let wait_secs = 60 - now.duration_since(*oldest).as_secs();
+                                Some(wait_secs)
+                            }
+                        };
+
+                            match wait_time {
+                                None => break,
+                                Some(secs) => {
+                                    warn!("Rate limit hit for model: {}, waiting {}s", model, secs);
+                                    tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Build the upstream request
     let upstream_request = state
@@ -250,6 +312,7 @@ async fn main() {
         upstream_base: args.upstream_base.trim_end_matches('/').to_string(),
         http_referer: args.http_referer,
         x_title: args.x_title,
+        rate_limits: Mutex::new(HashMap::new()),
     });
 
     // Build the router with catch-all route
