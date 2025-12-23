@@ -12,8 +12,8 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn, Level};
 
@@ -21,11 +21,11 @@ const RATE_LIMIT_RPM: usize = 3; // requests per minute per model
 
 const RATE_LIMITED_MODELS: &[&str] = &[
     "anthropic/claude-opus-4.5",
+    "anthropic/claude-haiku-4.5",
     "anthropic/claude-sonnet-4.5",
     "google/gemini-3-pro-preview",
-    "google/gemini-3-flash-preview"
+    "google/gemini-3-flash-preview",
 ];
-
 
 /// OpenRouter Header Proxy - Injects attribution headers for OpenRouter API requests
 #[derive(Parser, Debug)]
@@ -166,32 +166,39 @@ async fn proxy_handler(
                     if !RATE_LIMITED_MODELS.is_empty() && RATE_LIMITED_MODELS.contains(&model) {
                         // Check rate limit and wait if needed
                         loop {
-                        let wait_time = {
-                            let now = Instant::now();
-                            let mut limits = state.rate_limits.lock().await;
-                            let timestamps = limits.entry(model.to_string()).or_insert_with(Vec::new);
+                            let wait_time = {
+                                let now = Instant::now();
+                                let mut limits = state.rate_limits.lock().await;
+                                let timestamps =
+                                    limits.entry(model.to_string()).or_insert_with(Vec::new);
 
-                            // Remove timestamps older than 1 minute
-                            timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
+                                // Remove timestamps older than 1 minute
+                                timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
 
-                            if timestamps.len() < RATE_LIMIT_RPM {
-                                // Record this request and proceed
-                                timestamps.push(now);
-                                info!("Rate limit: {}/{} for model {}", timestamps.len(), RATE_LIMIT_RPM, model);
-                                None
-                            } else {
-                                // Find oldest timestamp and calculate wait time
-                                let oldest = timestamps.iter().min().unwrap();
-                                let wait_secs = 60 - now.duration_since(*oldest).as_secs();
-                                Some(wait_secs)
-                            }
-                        };
+                                if timestamps.len() < RATE_LIMIT_RPM {
+                                    // Record this request and proceed
+                                    timestamps.push(now);
+                                    info!(
+                                        "Rate limit: {}/{} for model {}",
+                                        timestamps.len(),
+                                        RATE_LIMIT_RPM,
+                                        model
+                                    );
+                                    None
+                                } else {
+                                    // Find oldest timestamp and calculate wait time
+                                    let oldest = timestamps.iter().min().unwrap();
+                                    let wait_secs = 60 - now.duration_since(*oldest).as_secs();
+                                    Some(wait_secs)
+                                }
+                            };
 
                             match wait_time {
                                 None => break,
                                 Some(secs) => {
                                     warn!("Rate limit hit for model: {}, waiting {}s", model, secs);
-                                    tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
+                                    tokio::time::sleep(std::time::Duration::from_secs(secs + 2))
+                                        .await;
                                 }
                             }
                         }
@@ -296,12 +303,12 @@ async fn main() {
 
     // Create HTTP client
     let mut client_builder = Client::builder();
-    
+
     if args.danger_accept_invalid_certs {
         tracing::warn!("⚠️  TLS certificate verification is DISABLED - only use for debugging!");
         client_builder = client_builder.danger_accept_invalid_certs(true);
     }
-    
+
     let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
