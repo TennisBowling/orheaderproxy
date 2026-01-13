@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn, Level};
 
-const RATE_LIMIT_RPM: usize = 3; // requests per minute per model
+const RATE_LIMIT_RPM: usize = 2; // requests per minute per model
 
 const RATE_LIMITED_MODELS: &[&str] = &[
     "anthropic/claude-opus-4.5",
@@ -26,6 +26,18 @@ const RATE_LIMITED_MODELS: &[&str] = &[
     "google/gemini-3-pro-preview",
     "google/gemini-3-flash-preview",
 ];
+
+/// Provider order for each rate-limited model (edit these to change provider priority)
+fn get_provider_order(model: &str) -> Option<&'static [&'static str]> {
+    match model {
+        "anthropic/claude-opus-4.5" => Some(&["amazon-bedrock"]),
+        "anthropic/claude-haiku-4.5" => Some(&["amazon-bedrock"]),
+        "anthropic/claude-sonnet-4.5" => Some(&["amazon-bedrock"]),
+        "google/gemini-3-pro-preview" => Some(&["google-vertex"]),
+        "google/gemini-3-flash-preview" => Some(&["google-vertex"]),
+        _ => None,
+    }
+}
 
 /// OpenRouter Header Proxy - Injects attribution headers for OpenRouter API requests
 #[derive(Parser, Debug)]
@@ -64,6 +76,7 @@ struct AppState {
     x_title: String,
     // Maps model name -> list of request timestamps (for rate limiting)
     rate_limits: Mutex<HashMap<String, Vec<Instant>>>,
+    verbose: bool,
 }
 
 /// Hop-by-hop headers that must NOT be forwarded by proxies
@@ -154,16 +167,26 @@ async fn proxy_handler(
 
     tracing::debug!("Request body size: {} bytes", body_bytes.len());
 
-    // Extract model from request body and check rate limit
+    if state.verbose {
+        if let Ok(body_str) = std::str::from_utf8(&body_bytes) {
+            println!("Request Body: {}", body_str);
+        }
+    }
+
+    // Extract model from request body, check rate limit, and inject provider order
+    let mut final_body = body_bytes.to_vec();
     if !body_bytes.is_empty() {
         if let Ok(body_str) = std::str::from_utf8(&body_bytes) {
             // Parse JSON to extract model field
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body_str) {
                 if let Some(model) = json.get("model").and_then(|m| m.as_str()) {
                     info!("Request for model: {}", model);
 
-                    // Only rate limit if model is in the list
-                    if !RATE_LIMITED_MODELS.is_empty() && RATE_LIMITED_MODELS.contains(&model) {
+                    // Skip rate limiting for count_tokens endpoint
+                    let skip_rate_limit = path.starts_with("/api/v1/messages/count_tokens");
+
+                    // Only rate limit if model is in the list and not a skipped endpoint
+                    if !skip_rate_limit && !RATE_LIMITED_MODELS.is_empty() && RATE_LIMITED_MODELS.contains(&model) {
                         // Check rate limit and wait if needed
                         loop {
                             let wait_time = {
@@ -202,6 +225,18 @@ async fn proxy_handler(
                                 }
                             }
                         }
+
+                        // Inject provider order if configured for this model
+                        if let Some(order) = get_provider_order(model) {
+                            let provider = json.get("provider").cloned();
+                            let mut provider_obj = provider
+                                .and_then(|p| p.as_object().cloned())
+                                .unwrap_or_default();
+                            provider_obj.insert("order".to_string(), serde_json::json!(order));
+                            json["provider"] = serde_json::Value::Object(provider_obj);
+                            info!("Injected provider order: {:?}", order);
+                            final_body = serde_json::to_vec(&json).unwrap_or(body_bytes.to_vec());
+                        }
                     }
                 }
             }
@@ -213,7 +248,7 @@ async fn proxy_handler(
         .client
         .request(method_to_reqwest(&method), &upstream_url)
         .headers(forward_headers.clone())
-        .body(body_bytes);
+        .body(final_body);
 
     tracing::info!("Sending request to: {}", upstream_url);
 
@@ -320,6 +355,7 @@ async fn main() {
         http_referer: args.http_referer,
         x_title: args.x_title,
         rate_limits: Mutex::new(HashMap::new()),
+        verbose: args.verbose,
     });
 
     // Build the router with catch-all route
