@@ -17,24 +17,58 @@ use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn, Level};
 
-const RATE_LIMIT_RPM: usize = 2; // requests per minute per model
+enum ProviderPreference {
+    Order(&'static [&'static str]),
+    Only(&'static [&'static str]),
+}
 
-const RATE_LIMITED_MODELS: &[&str] = &[
-    "anthropic/claude-opus-4.5",
-    "anthropic/claude-haiku-4.5",
-    "anthropic/claude-sonnet-4.5",
-    "google/gemini-3-pro-preview",
-    "google/gemini-3-flash-preview",
-];
+struct ModelConfig {
+    rate_limit: usize,
+    provider_preference: Option<ProviderPreference>,
+    reasoning_effort: Option<&'static str>,
+}
 
-/// Provider order for each rate-limited model (edit these to change provider priority)
-fn get_provider_order(model: &str) -> Option<&'static [&'static str]> {
+const DEFAULT_RPM: usize = 2;
+
+/// Configuration for specific models
+fn get_model_config(model: &str) -> Option<ModelConfig> {
     match model {
-        "anthropic/claude-opus-4.5" => Some(&["amazon-bedrock"]),
-        "anthropic/claude-haiku-4.5" => Some(&["amazon-bedrock"]),
-        "anthropic/claude-sonnet-4.5" => Some(&["amazon-bedrock"]),
-        "google/gemini-3-pro-preview" => Some(&["google-vertex"]),
-        "google/gemini-3-flash-preview" => Some(&["google-vertex"]),
+        "anthropic/claude-opus-4.6" => Some(ModelConfig {
+            rate_limit: 2,
+            provider_preference: Some(ProviderPreference::Only(&["amazon-bedrock"])),
+            reasoning_effort: None,
+        }),
+        "anthropic/claude-opus-4.5" => Some(ModelConfig {
+            rate_limit: 2,
+            provider_preference: Some(ProviderPreference::Only(&["amazon-bedrock"])),
+            reasoning_effort: Some("high"),
+        }),
+        "anthropic/claude-haiku-4.5" => Some(ModelConfig {
+            rate_limit: 2,
+            provider_preference: Some(ProviderPreference::Only(&["amazon-bedrock"])),
+            reasoning_effort: Some("high"),
+        }),
+        "anthropic/claude-sonnet-4.5" => Some(ModelConfig {
+            rate_limit: 2,
+            provider_preference: Some(ProviderPreference::Only(&["amazon-bedrock"])),
+            reasoning_effort: Some("high"),
+        }),
+        "google/gemini-3-pro-preview" => Some(ModelConfig {
+            rate_limit: 5000000,
+            provider_preference: Some(ProviderPreference::Order(&[
+                "google-ai-studio",
+                "google-vertex",
+            ])),
+            reasoning_effort: Some("high"),
+        }),
+        "google/gemini-3-flash-preview" => Some(ModelConfig {
+            rate_limit: 5000000,
+            provider_preference: Some(ProviderPreference::Order(&[
+                "google-ai-studio",
+                "google-vertex",
+            ])),
+            reasoning_effort: Some("high"),
+        }),
         _ => None,
     }
 }
@@ -182,59 +216,93 @@ async fn proxy_handler(
                 if let Some(model) = json.get("model").and_then(|m| m.as_str()) {
                     info!("Request for model: {}", model);
 
+                    let model_config = get_model_config(model);
+
                     // Skip rate limiting for count_tokens endpoint
                     let skip_rate_limit = path.starts_with("/api/v1/messages/count_tokens");
 
-                    // Only rate limit if model is in the list and not a skipped endpoint
-                    if !skip_rate_limit && !RATE_LIMITED_MODELS.is_empty() && RATE_LIMITED_MODELS.contains(&model) {
-                        // Check rate limit and wait if needed
-                        loop {
-                            let wait_time = {
-                                let now = Instant::now();
-                                let mut limits = state.rate_limits.lock().await;
-                                let timestamps =
-                                    limits.entry(model.to_string()).or_insert_with(Vec::new);
+                    // Only rate limit if model has a config and not a skipped endpoint
+                    if !skip_rate_limit {
+                        if let Some(config) = &model_config {
+                            // Check rate limit and wait if needed
+                            loop {
+                                let wait_time = {
+                                    let now = Instant::now();
+                                    let mut limits = state.rate_limits.lock().await;
+                                    let timestamps =
+                                        limits.entry(model.to_string()).or_insert_with(Vec::new);
 
-                                // Remove timestamps older than 1 minute
-                                timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
+                                    // Remove timestamps older than 1 minute
+                                    timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
 
-                                if timestamps.len() < RATE_LIMIT_RPM {
-                                    // Record this request and proceed
-                                    timestamps.push(now);
-                                    info!(
-                                        "Rate limit: {}/{} for model {}",
-                                        timestamps.len(),
-                                        RATE_LIMIT_RPM,
-                                        model
-                                    );
-                                    None
-                                } else {
-                                    // Find oldest timestamp and calculate wait time
-                                    let oldest = timestamps.iter().min().unwrap();
-                                    let wait_secs = 60 - now.duration_since(*oldest).as_secs();
-                                    Some(wait_secs)
-                                }
-                            };
+                                    if timestamps.len() < config.rate_limit {
+                                        // Record this request and proceed
+                                        timestamps.push(now);
+                                        info!(
+                                            "Rate limit: {}/{} for model {}",
+                                            timestamps.len(),
+                                            config.rate_limit,
+                                            model
+                                        );
+                                        None
+                                    } else {
+                                        // Find oldest timestamp and calculate wait time
+                                        let oldest = timestamps.iter().min().unwrap();
+                                        let wait_secs = 60 - now.duration_since(*oldest).as_secs();
+                                        Some(wait_secs)
+                                    }
+                                };
 
-                            match wait_time {
-                                None => break,
-                                Some(secs) => {
-                                    warn!("Rate limit hit for model: {}, waiting {}s", model, secs);
-                                    tokio::time::sleep(std::time::Duration::from_secs(secs + 2))
+                                match wait_time {
+                                    None => break,
+                                    Some(secs) => {
+                                        warn!(
+                                            "Rate limit hit for model: {}, waiting {}s",
+                                            model, secs
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            secs + 2,
+                                        ))
                                         .await;
+                                    }
                                 }
                             }
                         }
+                    }
 
-                        // Inject provider order if configured for this model
-                        if let Some(order) = get_provider_order(model) {
+                    // Modify the request body based on model config
+                    if let Some(config) = model_config {
+                        let mut modified = false;
+
+                        // Inject provider preference if configured for this model
+                        if let Some(pref) = config.provider_preference {
                             let provider = json.get("provider").cloned();
                             let mut provider_obj = provider
                                 .and_then(|p| p.as_object().cloned())
                                 .unwrap_or_default();
-                            provider_obj.insert("order".to_string(), serde_json::json!(order));
+                            let (key, providers) = match &pref {
+                                ProviderPreference::Order(p) => ("order", *p),
+                                ProviderPreference::Only(p) => ("only", *p),
+                            };
+                            provider_obj.insert(key.to_string(), serde_json::json!(providers));
                             json["provider"] = serde_json::Value::Object(provider_obj);
-                            info!("Injected provider order: {:?}", order);
+                            info!("Injected provider {}: {:?}", key, providers);
+                            modified = true;
+                        }
+
+                        // Inject reasoning effort if configured
+                        if let Some(effort) = config.reasoning_effort {
+                            let reasoning = json.get("reasoning").cloned();
+                            let mut reasoning_obj = reasoning
+                                .and_then(|r| r.as_object().cloned())
+                                .unwrap_or_default();
+                            reasoning_obj.insert("effort".to_string(), serde_json::json!(effort));
+                            json["reasoning"] = serde_json::Value::Object(reasoning_obj);
+                            info!("Injected reasoning effort: {}", effort);
+                            modified = true;
+                        }
+
+                        if modified {
                             final_body = serde_json::to_vec(&json).unwrap_or(body_bytes.to_vec());
                         }
                     }
@@ -243,44 +311,54 @@ async fn proxy_handler(
         }
     }
 
-    // Build the upstream request
-    let upstream_request = state
-        .client
-        .request(method_to_reqwest(&method), &upstream_url)
-        .headers(forward_headers.clone())
-        .body(final_body);
+    // Build and send the upstream request with retries for 429s
+    let upstream_response = loop {
+        let upstream_request = state
+            .client
+            .request(method_to_reqwest(&method), &upstream_url)
+            .headers(forward_headers.clone())
+            .body(final_body.clone());
 
-    tracing::info!("Sending request to: {}", upstream_url);
+        tracing::info!("Sending request to: {}", upstream_url);
 
-    // Send the request and get a streaming response
-    let upstream_response = upstream_request.send().await.map_err(|e| {
-        tracing::error!("Upstream request failed: {}", e);
-        // Log the full error chain
-        let mut source = StdError::source(&e);
-        let mut depth = 1;
-        while let Some(err) = source {
-            tracing::error!("  Caused by ({}): {}", depth, err);
-            source = err.source();
-            depth += 1;
+        // Send the request and get a response
+        let response = upstream_request.send().await.map_err(|e| {
+            tracing::error!("Upstream request failed: {}", e);
+            // Log the full error chain
+            let mut source = StdError::source(&e);
+            let mut depth = 1;
+            while let Some(err) = source {
+                tracing::error!("  Caused by ({}): {}", depth, err);
+                source = err.source();
+                depth += 1;
+            }
+            // Log additional error details
+            if e.is_connect() {
+                tracing::error!("Error type: Connection error");
+            }
+            if e.is_timeout() {
+                tracing::error!("Error type: Timeout");
+            }
+            if e.is_request() {
+                tracing::error!("Error type: Request error");
+            }
+            if e.is_builder() {
+                tracing::error!("Error type: Builder error");
+            }
+            if let Some(url) = e.url() {
+                tracing::error!("Failed URL: {}", url);
+            }
+            StatusCode::BAD_GATEWAY
+        })?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            warn!("Received 429 from upstream, retrying in 10 seconds...");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            continue;
         }
-        // Log additional error details
-        if e.is_connect() {
-            tracing::error!("Error type: Connection error");
-        }
-        if e.is_timeout() {
-            tracing::error!("Error type: Timeout");
-        }
-        if e.is_request() {
-            tracing::error!("Error type: Request error");
-        }
-        if e.is_builder() {
-            tracing::error!("Error type: Builder error");
-        }
-        if let Some(url) = e.url() {
-            tracing::error!("Failed URL: {}", url);
-        }
-        StatusCode::BAD_GATEWAY
-    })?;
+
+        break response;
+    };
 
     // Get the status code
     let status = upstream_response.status();
