@@ -57,18 +57,33 @@ fn get_model_config(model: &str) -> Option<ModelConfig> {
         "google/gemini-3.1-pro-preview" => Some(ModelConfig {
             rate_limit: 5000000,
             provider_preference: Some(ProviderPreference::Order(&[
-                "google-ai-studio",
                 "google-vertex",
+                "google-ai-studio",
             ])),
             reasoning_effort: Some("high"),
         }),
         "google/gemini-3-flash-preview" => Some(ModelConfig {
             rate_limit: 5000000,
             provider_preference: Some(ProviderPreference::Order(&[
-                "google-ai-studio",
                 "google-vertex",
+                "google-ai-studio",
             ])),
             reasoning_effort: Some("high"),
+        }),
+        "openai/gpt-5.4-mini" => Some(ModelConfig {
+            rate_limit: usize::MAX,
+            provider_preference: None,
+            reasoning_effort: None,
+        }),
+        "deepseek/deepseek-v4-flash" => Some(ModelConfig {
+            rate_limit: usize::MAX,
+            provider_preference: Some(ProviderPreference::Only(&["deepseek"])),
+            reasoning_effort: None,
+        }),
+        "deepseek/deepseek-v4-pro" => Some(ModelConfig {
+            rate_limit: usize::MAX,
+            provider_preference: Some(ProviderPreference::Only(&["deepseek"])),
+            reasoning_effort: None,
         }),
         _ => None,
     }
