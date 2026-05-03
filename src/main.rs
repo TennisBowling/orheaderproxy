@@ -7,10 +7,11 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -34,8 +35,8 @@ const DEFAULT_RPM: usize = 2;
 fn get_model_config(model: &str) -> Option<ModelConfig> {
     match model {
         "anthropic/claude-opus-4.6" => Some(ModelConfig {
-            rate_limit: 2,
-            provider_preference: Some(ProviderPreference::Only(&["amazon-bedrock"])),
+            rate_limit: 2000,
+            provider_preference: Some(ProviderPreference::Order(&["anthropic"])),
             reasoning_effort: None,
         }),
         "anthropic/claude-opus-4.5" => Some(ModelConfig {
@@ -53,7 +54,7 @@ fn get_model_config(model: &str) -> Option<ModelConfig> {
             provider_preference: Some(ProviderPreference::Only(&["amazon-bedrock"])),
             reasoning_effort: Some("high"),
         }),
-        "google/gemini-3-pro-preview" => Some(ModelConfig {
+        "google/gemini-3.1-pro-preview" => Some(ModelConfig {
             rate_limit: 5000000,
             provider_preference: Some(ProviderPreference::Order(&[
                 "google-ai-studio",
@@ -124,6 +125,20 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+/// If the first line of `text` contains "x-anthropic-billing-header",
+/// return the text with that first line removed.
+fn strip_billing_marker_line(text: &str) -> Option<String> {
+    let (first_line, rest) = match text.split_once('\n') {
+        Some((f, r)) => (f, Some(r)),
+        None => (text, None),
+    };
+    if first_line.contains("x-anthropic-billing-header") {
+        Some(rest.unwrap_or("").to_string())
+    } else {
+        None
+    }
+}
 
 /// Check if a header is a hop-by-hop header
 fn is_hop_by_hop(name: &str) -> bool {
@@ -213,6 +228,40 @@ async fn proxy_handler(
         if let Ok(body_str) = std::str::from_utf8(&body_bytes) {
             // Parse JSON to extract model field
             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                let mut body_modified_by_strip = false;
+                if let Some(first_msg) = json
+                    .get_mut("messages")
+                    .and_then(|m| m.as_array_mut())
+                    .and_then(|arr| arr.first_mut())
+                {
+                    if let Some(content) = first_msg.get_mut("content") {
+                        if let Some(s) = content.as_str() {
+                            if let Some(stripped) = strip_billing_marker_line(s) {
+                                info!("Stripping x-anthropic-billing-header line from first message");
+                                *content = serde_json::Value::String(stripped);
+                                body_modified_by_strip = true;
+                            }
+                        } else if let Some(arr) = content.as_array_mut() {
+                            if let Some(first_text) = arr
+                                .iter_mut()
+                                .find(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            {
+                                if let Some(text) = first_text.get("text").and_then(|t| t.as_str()) {
+                                    if let Some(stripped) = strip_billing_marker_line(text) {
+                                        info!("Stripping x-anthropic-billing-header line from first message");
+                                        first_text["text"] = serde_json::Value::String(stripped);
+                                        body_modified_by_strip = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if body_modified_by_strip {
+                    final_body = serde_json::to_vec(&json).unwrap_or(body_bytes.to_vec());
+                }
+
                 if let Some(model) = json.get("model").and_then(|m| m.as_str()) {
                     info!("Request for model: {}", model);
 
@@ -303,7 +352,7 @@ async fn proxy_handler(
                         }
 
                         if modified {
-                            final_body = serde_json::to_vec(&json).unwrap_or(body_bytes.to_vec());
+                            final_body = serde_json::to_vec(&json).unwrap_or(final_body);
                         }
                     }
                 }
@@ -363,6 +412,12 @@ async fn proxy_handler(
     // Get the status code
     let status = upstream_response.status();
 
+    if state.verbose {
+        println!("Response Status: {}", status);
+        print!("Response Body: ");
+        let _ = std::io::stdout().flush();
+    }
+
     // Build response headers (strip hop-by-hop)
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream_response.headers() {
@@ -372,9 +427,24 @@ async fn proxy_handler(
     }
 
     // Stream the response body back to the client
+    let verbose = state.verbose;
     let stream = upstream_response
         .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .inspect_ok(move |bytes| {
+            if verbose {
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    print!("{}", s);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        })
+        .chain(futures::stream::once(async move {
+            if verbose {
+                println!();
+            }
+            Ok(axum::body::Bytes::new())
+        }));
 
     let body = Body::from_stream(stream);
 
